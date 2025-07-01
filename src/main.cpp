@@ -1,5 +1,6 @@
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <iostream>
 
 typedef int8_t s8;
@@ -13,6 +14,44 @@ typedef uint32_t u32;
 #define getBits543(byte) (((byte) & 0x38) >> 3)
 #define getBits43(byte) (((byte) & 0x18) >> 3)
 #define getBits210(byte) ((byte) & 0x7)
+
+#define BOOT_OFF 0xFF50
+
+class BUS {
+private:
+  u8 memory[65536];  // 0x0000 - 0xFFFF
+  
+  /* memory map
+    0x0000 - 0x00FF   256 bytes     boot ROM
+    
+    0x0000 - 0x3FFF   16384 bytes   game ROM bank 0
+    0x4000 - 0x7FFF   16384 bytes   game ROM bank N
+    0x8000 - 0x97FF   6144 bytes    tile RAM
+    0x9800 - 0x9FFF   2048 bytes    background map 
+    0xA000 - 0xBFFF   8192 bytes    cartridge RAM 
+    0xC000 - 0xDFFF   8192 bytes    working RAM
+    0xE000 - 0xFDFF   7680 bytes    echo RAM
+    0xFE00 - 0xFE9F   160 bytes     OAM (Object Attribute bus)
+    0xFEA0 - 0xFEFF   96 bytes      unused
+    0xFF00 - 0xFF7F   128 bytes     I/O registers
+    0xFF80 - 0xFFFE   127 bytes     high RAM
+    0xFFFF            1 byte        interrupt enabled register
+  */
+
+public:
+  u8 operator [](u16 addr) const {
+    return memory[addr];
+  }
+
+  u8 & operator [](u16 addr) {
+    return memory[addr];
+  }
+
+public:
+  void init() {
+
+  }
+};
 
 class CPU {
 public:
@@ -31,14 +70,15 @@ public:
     bool  subtract() { return f & 0b01000000; }
     bool halfcarry() { return f & 0b00100000; }
     bool     carry() { return f & 0b00010000; }
+  
+    u16 pc; // program counter
+    u16 sp; // stack pointer
+    
+    // TODO: implement interrupts, ime_next
+    bool ime, ime_next; // interrupt enable flag
   } reg;
 
-  struct memoryBus {
-    u8 memory[65536];
-  } bus; 
-
-  u16 pc; // program counter
-  u16 sp; // stack pointer
+  BUS bus;
 
 public:
   //  https://gbdev.io/pandocs/CPU_Instruction_Set.html
@@ -336,7 +376,7 @@ public:
       case 3: r8 = &reg.e; break;
       case 4: r8 = &reg.h; break;
       case 5: r8 = &reg.l; break;
-      case 6: r8 = &bus.memory[reg.hl]; break;
+      case 6: r8 = &bus[reg.hl]; break;
       case 7: r8 = &reg.a; break;
     } r8_1 = r8;
     switch (i.r8_2) {
@@ -346,7 +386,7 @@ public:
       case 3: r8_2 = &reg.e; break;
       case 4: r8_2 = &reg.h; break;
       case 5: r8_2 = &reg.l; break;
-      case 6: r8_2 = &bus.memory[reg.hl]; break;
+      case 6: r8_2 = &bus[reg.hl]; break;
       case 7: r8_2 = &reg.a; break;
     }
     u16 *r16, *r16stk, *r16mem; int hlid = 0;
@@ -354,7 +394,7 @@ public:
       case 0: r16 = &reg.bc; r16stk = &reg.bc; r16mem = &reg.bc; break;
       case 1: r16 = &reg.de; r16stk = &reg.de; r16mem = &reg.de; break;
       case 2: r16 = &reg.hl; r16stk = &reg.hl; r16mem = &reg.hl; hlid = 1; break;
-      case 3: r16 = &sp;     r16stk = &reg.af; r16mem = &reg.hl; hlid = -1;break;
+      case 3: r16 = &reg.sp; r16stk = &reg.af; r16mem = &reg.hl; hlid = -1;break;
     }
     bool cond;
     switch (i.cond) {
@@ -368,13 +408,13 @@ public:
       // block 0
       case NOP: return {1,1};
       case LD_R16_IMM16: (*r16) = i.imm16; return {3,3};
-      case LD_atR16mem_A: bus.memory[*r16mem] = reg.a;
+      case LD_atR16mem_A: bus[*r16mem] = reg.a;
         reg.hl += hlid; return {2,1};
-      case LD_A_atR16mem: reg.a = bus.memory[*r16mem];
+      case LD_A_atR16mem: reg.a = bus[*r16mem];
         reg.hl += hlid; return {2,1};
       case LD_atIMM16_SP:
-        bus.memory[i.imm16] = sp & 0xFF;
-        bus.memory[i.imm16+1] = sp >> 8;
+        bus[i.imm16] = reg.sp & 0xFF;
+        bus[i.imm16+1] = reg.sp >> 8;
         return {5,3};
       case INC_R16: (*r16)++; return {2,1};
       case DEC_R16: (*r16)--; return {2,1};
@@ -439,9 +479,9 @@ public:
         reg.carry(!reg.carry());
         return {1,1};
       case JR_IMM8: // instruction 2 bytes, but jp so return 0
-        pc += (s8)i.imm8; return {3,0};
+        reg.pc += (s8)i.imm8; return {3,0};
       case JR_COND_IMM8:
-        if (cond) { pc += (s8)i.imm8; return {3,0}; }
+        if (cond) { reg.pc += (s8)i.imm8; return {3,0}; }
         return {2,2};
       case STOP: status = STOPPED; return {0,2};
       // block 1
@@ -485,19 +525,157 @@ public:
         return {1,1}; }
       case RET_COND:
         if (cond) {
-          u8 lsb = bus.memory[sp++];
-          u8 msb = bus.memory[sp++];
-          pc = ((u16)msb << 8) | (u16)lsb;
+          u8 lsb = bus[reg.sp++];
+          u8 msb = bus[reg.sp++];
+          reg.pc = ((u16)msb << 8) | (u16)lsb;
           return {5,0};
         } return {2,1};
       case RET: {
-        u8 lsb = bus.memory[sp++];
-        u8 msb = bus.memory[sp++];
-        pc = ((u16)msb << 8) | (u16)lsb;
+        u8 lsb = bus[reg.sp++];
+        u8 msb = bus[reg.sp++];
+        reg.pc = ((u16)msb << 8) | (u16)lsb;
         return {4,0}; }
-      case RETI: // TODO implement interrupt flag
-      default: return {0,1};
+      case RETI: {
+        u8 lsb = bus[reg.sp++];
+        u8 msb = bus[reg.sp++];
+        reg.pc = ((u16)msb << 8) | (u16)lsb;
+        reg.ime = true;
+        return {4,0}; }
+      case JP_COND_IMM16:
+        if (cond) { reg.pc = i.imm16; return {4,0};}
+        return {3,3};
+      case JP_IMM16: reg.pc = i.imm16; return {4,0};
+      case JP_HL: reg.pc = reg.hl; return {1,0};
+      case CALL_COND_IMM16: if (cond) {
+          bus[--reg.sp] = (u8)(reg.pc >> 8);
+          bus[--reg.sp] = (u8)(reg.pc & 0xFF);
+          reg.pc = i.imm16; return {6,0};
+        } return {3,3};
+      case CALL_IMM16:
+        bus[--reg.sp] = (u8)(reg.pc >> 8);
+        bus[--reg.sp] = (u8)(reg.pc & 0xFF);
+        reg.pc = i.imm16; return {6,0};
+      case RST_TGT3:
+        bus[--reg.sp] = (u8)(reg.pc >> 8);
+        bus[--reg.sp] = (u8)(reg.pc & 0xFF);
+        reg.pc = i.tgt3; return {4,0};
+      case POP_R16STK: {
+        u8 lsb = bus[reg.sp++];
+        u8 msb = bus[reg.sp++];
+        (*r16stk) = ((u16)msb << 8) | (u16)lsb;
+        return {3,1}; }
+      case PUSH_R16STK:
+        bus[--reg.sp] = (u8)((*r16stk) >> 8);
+        bus[--reg.sp] = (u8)((*r16stk) & 0xFF);
+        return {4,1};
+      case LDH_atC_A:
+        bus[(u16)reg.c | 0xFF00] = reg.a;
+        return {2,1};
+      case LDH_atIMM8_A:
+        bus[(u16)i.imm8 | 0xFF00] = reg.a;
+        return {3,2};
+      case LD_atIMM16_A:
+        bus[i.imm16] = reg.a;
+        return {4,3};
+      case LDH_A_atC:
+        reg.a = bus[(u16)reg.c | 0xFF00];
+        return {2,1};
+      case LDH_A_atIMM8:
+        reg.a = bus[(u16)i.imm8 | 0xFF00];
+        return {3,2};
+      case LD_A_atIMM16:
+        reg.a = bus[i.imm16];
+        return {4,3};
+      case ADD_SP_IMM8: {
+        s16 quarterres = (s16)(reg.sp & 0xF) + (s16)(s8)i.imm8;
+        s32 halfres = (s32)(reg.sp & 0xFF) + (s32)(s8)i.imm8;
+        reg.zero(false); reg.subtract(false);
+        reg.halfcarry(quarterres < 0 || quarterres > 0xF);
+        reg.carry(halfres < 0 || halfres > 0xFF);
+        reg.sp = (u16)((s32)reg.sp + (s32)(s8)i.imm8);
+        return {4,2}; }
+      case LD_HL_SPplusIMM8: {
+        s16 quarterres = (s16)(reg.sp & 0xF) + (s16)(s8)i.imm8;
+        s32 halfres = (s32)(reg.sp & 0xFF) + (s32)(s8)i.imm8;
+        reg.zero(false); reg.subtract(false);
+        reg.halfcarry(quarterres < 0 || quarterres > 0xF);
+        reg.carry(halfres < 0 || halfres > 0xFF);
+        reg.hl = (u16)((s32)reg.sp + (s32)(s8)i.imm8);
+        return {3,2}; }
+      case LD_SP_HL: reg.sp = reg.hl; return {2,1};
+      case DI: reg.ime = 0; return {1,1};
+      case EI: reg.ime_next = 1; return {1,1};
+      case RLC_R8:
+        reg.f = 0; // clear rest of flags
+        reg.carry(((*r8) & 0x80) == 0x80);
+        (*r8) <<= 1; if (reg.carry()) (*r8) |= 1;
+        reg.zero((*r8) == 0);
+        if (i.r8 == AT_HL) return {4,2};
+        return {2,2};
+      case RRC_R8:
+        reg.f = 0; // clear rest of flags
+        reg.carry(((*r8) & 1) == 1);
+        (*r8) >>= 1; if (reg.carry()) (*r8) |= 0x80;
+        reg.zero((*r8) == 0);
+        if (i.r8 == AT_HL) return {4,2};
+        return {2,2};
+      case RL_R8:
+        reg.f = 0; // clear rest of flags
+        reg.carry(((*r8) & 0x80) == 0x80);
+        (*r8) <<= 1; if (prevCarry) (*r8) |= 1;
+        reg.zero((*r8) == 0);
+        if (i.r8 == AT_HL) return {4,2};
+        return {2,2};
+      case RR_R8:
+        reg.f = 0; // clear rest of flags
+        reg.carry(((*r8) & 1) == 1);
+        (*r8) >>= 1; if (prevCarry) (*r8) |= 0x80;
+        reg.zero((*r8) == 0);
+        if (i.r8 == AT_HL) return {4,2};
+        return {2,2};
+      case SLA_R8:
+        reg.f = 0; // clear rest of flags
+        reg.carry(((*r8) & 0x80) == 0x80);
+        (*r8) <<= 1;
+        reg.zero((*r8) == 0);
+        if (i.r8 == AT_HL) return {4,2};
+        return {2,2};
+      case SRA_R8:
+        reg.f = 0; // clear rest of flags
+        reg.carry(((*r8) & 1) == 1);
+        (*r8) >>= 1; if (i.r8 == AT_HL) (*r8) |= ((*r8) & 0x40) << 1;
+        reg.zero((*r8) == 0);
+        if (i.r8 == AT_HL) return {4,2};
+        return {2,2};
+      case SWAP_R8:
+        (*r8) = ((*r8) >> 4) | ((*r8) << 4);
+        if (i.r8 == AT_HL) return {4,2};
+        return {2,2};
+      case SRL_R8:
+        reg.f = 0; // clear rest of flags
+        reg.carry(((*r8) & 1) == 1);
+        (*r8) >>= 1;
+        reg.zero((*r8) == 0);
+        if (i.r8 == AT_HL) return {4,2};
+        return {2,2};
+      case BIT_B3_R8:
+        reg.zero(((*r8) & (1 << i.b3)) == 0);
+        reg.subtract(false);
+        reg.halfcarry(true);
+        if (i.r8 == AT_HL) return {3,2};
+        return {2,2};
+      case RES_B3_R8:
+        (*r8) &= ~(1 << i.b3);
+        if (i.r8 == AT_HL) return {4,2};
+        return {2,2};
+      case SET_B3_R8:
+        (*r8) |= (1 << i.b3);
+        if (i.r8 == AT_HL) return {4,2};
+        return {2,2};
+      default: break;
     }
+    printf("unable to execute instruction\n");
+    return {0,1};
   }
 
   void printState() {
@@ -506,19 +684,20 @@ public:
     printf("b: %#X\tc: %#X\tbc: %#02X   \tb: %hhu\tc: %hhu\tbc: %hu\n", reg.b, reg.c, reg.bc, reg.b, reg.c, reg.bc);
     printf("d: %#X\te: %#X\tde: %#02X   \td: %hhu\te: %hhu\tde: %hu\n", reg.d, reg.e, reg.de, reg.d, reg.e, reg.de);
     printf("h: %#X\tl: %#X\thl: %#02X   \th: %hhu\tl: %hhu\thl: %hu\n", reg.h, reg.l, reg.hl, reg.h, reg.l, reg.hl);
-    printf("pc: %#02X\tsp: %#02X\t\t\tpc: %hu\tsp: %hu\n", pc, sp, pc, sp);
+    printf("pc: %#02X\tsp: %#02X\t\t\tpc: %hu\tsp: %hu\n", reg.pc, reg.sp, reg.pc, reg.sp);
     printf("Flags: zero=%d subtract=%d halfcarry=%d carry = %d\n", reg.zero(), reg.subtract(), reg.halfcarry(), reg.carry());
   }
 
-  CPU() {
-
+  void init() {
+    bus.init();
+    reg.pc = 0x0000;
   }
 
 public:
   enum {
-    RUNNING, HALTED, STOPPED
-  } status;
-} cpu;
+    BOOTING, RUNNING, HALTED, STOPPED
+  } status = BOOTING;
+};
 
 // GB following units:
 //  - CPU 
@@ -532,45 +711,32 @@ public:
 //    - gamepad buttons
 
 int main(void) {
-  cpu.pc = 0;
-  cpu.bus.memory[0] = 0b00100001; // ld hl, imm16
-  cpu.bus.memory[1] = 0xA4; // imm16 = 420
-  cpu.bus.memory[2] = 0x01;
-  cpu.bus.memory[3] = 0b00101010; // ld a, [hli]
-  cpu.bus.memory[4] = 0b00110010; // ld [hld], a
-  cpu.bus.memory[6] = 0b00110001; // ld sp, imm16
-  cpu.bus.memory[7] = 0xA4; // imm16 = 420
-  cpu.bus.memory[8] = 0x01;
-  cpu.bus.memory[9] = 0b00001000; // ld [imm16], sp
-  cpu.bus.memory[10] = 0xA4; // imm16 = 420
-  cpu.bus.memory[11] = 0x01;
-  cpu.bus.memory[12] = 0b00010000; // stop
-
-  cpu.bus.memory[420] = 69;
+  CPU cpu;
+  cpu.init();
 
   cpu.printState();
 
   int cycles = 0;
-  while (cpu.status == CPU::RUNNING) {
-    u8 opcode = cpu.bus.memory[cpu.pc];
+  while (cpu.status == CPU::RUNNING || cpu.status == CPU::BOOTING) {
+    u8 opcode = cpu.bus[cpu.reg.pc];
     CPU::Instruction instruction = cpu.parseInstruction(opcode);
     if (instruction.type == CPU::ILLEGAL) {
       std::cout << "illegal opcode encountered" << std::endl; break;
     }
     if (instruction.type == CPU::PREFIX) {
-      opcode = cpu.bus.memory[cpu.pc+1];
+      opcode = cpu.bus[cpu.reg.pc+1];
       instruction = cpu.parsePrefixedInstruction(opcode);
     }
-    instruction.imm8low  = cpu.bus.memory[cpu.pc+1];
-    instruction.imm8high = cpu.bus.memory[cpu.pc+2];
+    instruction.imm8low  = cpu.bus[cpu.reg.pc+1];
+    instruction.imm8high = cpu.bus[cpu.reg.pc+2];
 
     CPU::ExecResult execResult = cpu.execute(instruction);
     cycles += execResult.cycles;
-    cpu.pc += execResult.bytes;
+    cpu.reg.pc += execResult.bytes;
   }
 
   cpu.printState();
-  printf("mem[420] = %hhu\n", cpu.bus.memory[420]);
-  printf("mem[421] = %hhu\n", cpu.bus.memory[421]);
+  printf("mem[420] = %hhu\n", cpu.bus[420]);
+  printf("mem[421] = %hhu\n", cpu.bus[421]);
   return 0;
 }
