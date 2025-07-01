@@ -2,6 +2,9 @@
 #include <cstdio>
 #include <iostream>
 
+typedef int8_t s8;
+typedef int16_t s16;
+typedef int32_t s32;
 typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
@@ -248,13 +251,75 @@ public:
   }
 
 private:
-  u8 add(u8 val) {
-    u8 res = reg.a + val;
-    reg.zero(res == 0);
-    reg.subtract(false);
-    reg.carry(((u16)reg.a + (u16)val) > 0xFF);
-    reg.halfcarry(((reg.a & 0xF) + (val & 0xF)) > 0xF);
-    return res;
+  struct Flags {
+    bool zero, subtract, halfcarry, carry;
+  };
+
+  Flags wrappingAdd(u8 &a, u8 b) {
+    u8 halfres = (a & 0xF) + (b & 0xF);
+    u16 result = (u16)a + (u16)b;
+    a = (u8)(result & 0xFF);
+    return {(a==0),false,
+      (halfres > 0xF), (result > 0xFF)};
+  }
+  
+  Flags wrappingAdc(u8 &a, u8 b) {
+    u8 halfres = (a & 0xF) + (b & 0xF) + (reg.carry() ? 1 : 0);
+    u16 result = (u16)a + (u16)b + (reg.carry() ? 1 : 0);
+    a = (u8)(result & 0xFF);
+    return {(a==0),false,
+      (halfres > 0xF), (result > 0xFF)};
+  }
+  
+  Flags wrappingSub(u8 &a, u8 b) {
+    s8 halfres = (s8)(a & 0xF) - (s8)(b & 0xF);
+    s16 result = (s16)a - (s16)b;
+    a = (result < 0) ? (u8)(result + 0x100) : (u8)(result);
+    return {(a==0),true,
+      (halfres < 0), (result < 0)};
+  }
+  
+  Flags wrappingSbc(u8 &a, u8 b) {
+    s8 halfres = (s8)(a & 0xF) - (s8)(b & 0xF) - (reg.carry() ? 1 : 0);
+    s16 result = (s16)a - (s16)b - (reg.carry() ? 1 : 0);
+    a = (result < 0) ? (u8)(result + 0x100) : (u8)(result);
+    return {(a==0),true,
+      (halfres < 0), (result < 0)};
+  }
+  
+  Flags wrappingAdd(u16 &a, u16 b) {
+    u16 halfres = (a & 0xFFF) + (b & 0xFFF);
+    u32 result = (u32)a + (u32)b;
+    a = (u16)(result & 0xFFFF);
+    return {(a==0),false,
+      (halfres > 0xFFF), (result > 0xFFFF)};
+  }
+  
+  Flags wrappingSub(u16 &a, u16 b) {
+    s16 halfres = (s16)(a & 0xFFF) - (s16)(b & 0xFFF);
+    s32 result = (s32)a - (s32)b;
+    a = (result < 0) ? (u16)(result + 0x10000) : (u16)(result);
+    return {(a==0),true,
+      (halfres < 0), (result < 0)};
+  }
+
+  void setFlags(Flags flags) {
+    reg.zero(flags.zero);
+    reg.subtract(flags.subtract);
+    reg.halfcarry(flags.halfcarry);
+    reg.carry(flags.halfcarry);
+  }
+  
+  void setFlagsZNH(Flags flags) {
+    reg.zero(flags.zero);
+    reg.subtract(flags.subtract);
+    reg.halfcarry(flags.halfcarry);
+  }
+  
+  void setFlagsNHC(Flags flags) {
+    reg.subtract(flags.subtract);
+    reg.halfcarry(flags.halfcarry);
+    reg.carry(flags.halfcarry);
   }
 
 public:
@@ -263,7 +328,7 @@ public:
   };
   ExecResult execute(Instruction i) {
     bool prevCarry = reg.carry();
-    u8 *r8; u16 *r16, *r16stk, *r16mem; int hlid = 0;
+    u8 *r8, *r8_1, *r8_2;      
     switch(i.r8) {
       case 0: r8 = &reg.b; break;
       case 1: r8 = &reg.c; break;
@@ -273,15 +338,34 @@ public:
       case 5: r8 = &reg.l; break;
       case 6: r8 = &bus.memory[reg.hl]; break;
       case 7: r8 = &reg.a; break;
+    } r8_1 = r8;
+    switch (i.r8_2) {
+      case 0: r8_2 = &reg.b; break;
+      case 1: r8_2 = &reg.c; break;
+      case 2: r8_2 = &reg.d; break;
+      case 3: r8_2 = &reg.e; break;
+      case 4: r8_2 = &reg.h; break;
+      case 5: r8_2 = &reg.l; break;
+      case 6: r8_2 = &bus.memory[reg.hl]; break;
+      case 7: r8_2 = &reg.a; break;
     }
+    u16 *r16, *r16stk, *r16mem; int hlid = 0;
     switch (i.r16) {
       case 0: r16 = &reg.bc; r16stk = &reg.bc; r16mem = &reg.bc; break;
       case 1: r16 = &reg.de; r16stk = &reg.de; r16mem = &reg.de; break;
       case 2: r16 = &reg.hl; r16stk = &reg.hl; r16mem = &reg.hl; hlid = 1; break;
       case 3: r16 = &sp;     r16stk = &reg.af; r16mem = &reg.hl; hlid = -1;break;
     }
+    bool cond;
+    switch (i.cond) {
+      case 0: cond = !reg.zero(); break;
+      case 1: cond = reg.zero(); break;
+      case 2: cond = !reg.carry(); break;
+      case 3: cond = reg.carry(); break;
+    }
 
     switch (i.type) {
+      // block 0
       case NOP: return {1,1};
       case LD_R16_IMM16: (*r16) = i.imm16; return {3,3};
       case LD_atR16mem_A: bus.memory[*r16mem] = reg.a;
@@ -295,23 +379,14 @@ public:
       case INC_R16: (*r16)++; return {2,1};
       case DEC_R16: (*r16)--; return {2,1};
       case ADDHL_R16:
-        reg.subtract(false);
-        reg.halfcarry(((reg.hl & 0xFFF) + ((*r16) & 0xFFF)) > 0xFFF);
-        reg.carry(((u32)reg.hl + (u32)(*r16)) > 0xFFFF);
-        reg.hl += (*r16);
+        setFlagsNHC(wrappingAdd(reg.hl, (*r16)));
         return {2,1};
       case INC_R8:
-        reg.zero((u8)((*r8) + 1) == 0);
-        reg.subtract(false);
-        reg.halfcarry(((*r8) & 0xF) == 0xF);
-        (*r8)++;
+        setFlagsZNH(wrappingAdd(*r8, 1));
         if (i.r8 == AT_HL) return {3,1};
         return {1,1};
       case DEC_R8:
-        reg.zero((u8)((*r8) - 1) == 0);
-        reg.subtract(true);
-        reg.halfcarry(((*r8) & 0xF) == 0x0);
-        (*r8)--;
+        setFlagsZNH(wrappingSub(*r8, 1));
         if (i.r8 == AT_HL) return {3,1};
         return {1,1};
       case LD_R8_IMM8: (*r8) = i.imm8; return {2,2};
@@ -335,7 +410,92 @@ public:
         reg.carry((reg.a & 1) == 1);
         reg.a >>= 1; if (prevCarry) reg.a |= 0x80;
         return {1,1};
+      case DAA: { // genuinely cancer
+        u8 adj = 0;
+        if ((!reg.subtract() && (reg.a & 0xF) > 0x09) ||
+            reg.halfcarry()) adj |= 0x06;
+        if ((!reg.subtract() && reg.a > 0x99) ||
+            reg.carry()) adj |= 0x60;
+        reg.zero(reg.a == 0);
+        reg.halfcarry(false);
+        if (!reg.subtract()) { reg.carry(
+            wrappingAdd(reg.a, adj).carry); }
+        else { reg.carry(
+            wrappingSub(reg.a, adj).carry); }
+        return {1,1}; }
+      case CPL:
+        reg.a = ~reg.a;
+        reg.subtract(true);
+        reg.halfcarry(true);
+        return {1,1};
+      case SCF:
+        reg.subtract(false);
+        reg.halfcarry(false);
+        reg.carry(true);
+        return {1,1};
+      case CCF:
+        reg.subtract(false);
+        reg.halfcarry(false);
+        reg.carry(!reg.carry());
+        return {1,1};
+      case JR_IMM8: // instruction 2 bytes, but jp so return 0
+        pc += (s8)i.imm8; return {3,0};
+      case JR_COND_IMM8:
+        if (cond) { pc += (s8)i.imm8; return {3,0}; }
+        return {2,2};
       case STOP: status = STOPPED; return {0,2};
+      // block 1
+      case LD_R8_R8: (*r8_1) = (*r8_2); return {1,1};
+      case HALT: status = HALTED; return {4,1};
+      // block 2
+      case ADD_A_R8: setFlags(wrappingAdd(reg.a, *r8));
+        return {1,1};
+      case ADC_A_R8: setFlags(wrappingAdc(reg.a, *r8));
+        return {1,1};
+      case SUB_A_R8: setFlags(wrappingSub(reg.a, *r8));
+        return {1,1};
+      case SBC_A_R8: setFlags(wrappingSbc(reg.a, *r8));
+        return {1,1};
+      case AND_A_R8: reg.a &= *r8; reg.f = 0x20;
+        reg.zero(reg.a == 0); return {1,1};
+      case XOR_A_R8: reg.a ^= *r8; reg.f = 0;
+        reg.zero(reg.a == 0); return {1,1};
+      case OR_A_R8: reg.a |= *r8; reg.f = 0;
+        reg.zero(reg.a == 0); return {1,1};
+      case CP_A_R8: { u8 temp = reg.a;
+        setFlags(wrappingSub(temp, *r8));
+        return {1,1}; }
+      // block 3
+      case ADD_A_IMM8: setFlags(wrappingAdd(reg.a, i.imm8));
+        return {1,1};
+      case ADC_A_IMM8: setFlags(wrappingAdc(reg.a, i.imm8));
+        return {1,1};
+      case SUB_A_IMM8: setFlags(wrappingSub(reg.a, i.imm8));
+        return {1,1};
+      case SBC_A_IMM8: setFlags(wrappingSbc(reg.a, i.imm8));
+        return {1,1};
+      case AND_A_IMM8: reg.a &= i.imm8; reg.f = 0x20;
+        reg.zero(reg.a == 0); return {1,1};
+      case XOR_A_IMM8: reg.a ^= i.imm8; reg.f = 0;
+        reg.zero(reg.a == 0); return {1,1};
+      case OR_A_IMM8: reg.a |= i.imm8; reg.f = 0;
+        reg.zero(reg.a == 0); return {1,1};
+      case CP_A_IMM8: { u8 temp = reg.a;
+        setFlags(wrappingSub(temp, i.imm8));
+        return {1,1}; }
+      case RET_COND:
+        if (cond) {
+          u8 lsb = bus.memory[sp++];
+          u8 msb = bus.memory[sp++];
+          pc = ((u16)msb << 8) | (u16)lsb;
+          return {5,0};
+        } return {2,1};
+      case RET: {
+        u8 lsb = bus.memory[sp++];
+        u8 msb = bus.memory[sp++];
+        pc = ((u16)msb << 8) | (u16)lsb;
+        return {4,0}; }
+      case RETI: // TODO implement interrupt flag
       default: return {0,1};
     }
   }
