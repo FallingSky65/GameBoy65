@@ -21,35 +21,81 @@ class BUS {
 private:
   u8 memory[65536];  // 0x0000 - 0xFFFF
   
-  /* memory map
+  /* 
+  memory map
     0x0000 - 0x00FF   256 bytes     boot ROM
     
     0x0000 - 0x3FFF   16384 bytes   game ROM bank 0
     0x4000 - 0x7FFF   16384 bytes   game ROM bank N
-    0x8000 - 0x97FF   6144 bytes    tile RAM
-    0x9800 - 0x9FFF   2048 bytes    background map 
+    0x8000 - 0x9FFF   8192 bytes    video RAM
     0xA000 - 0xBFFF   8192 bytes    cartridge RAM 
     0xC000 - 0xDFFF   8192 bytes    working RAM
     0xE000 - 0xFDFF   7680 bytes    echo RAM
-    0xFE00 - 0xFE9F   160 bytes     OAM (Object Attribute bus)
+    0xFE00 - 0xFE9F   160 bytes     OAM (Object Attribute Memory)
     0xFEA0 - 0xFEFF   96 bytes      unused
     0xFF00 - 0xFF7F   128 bytes     I/O registers
     0xFF80 - 0xFFFE   127 bytes     high RAM
-    0xFFFF            1 byte        interrupt enabled register
+    0xFFFF - 0xFFFF   1 byte        interrupt enabled register
+  
+  vram memory map
+    0x8000 - 0x97FF   3x128x16 = 6144 bytes
+      tile RAM: 3 blocks of 128 tiles
+      tile = 8x8 pixels, pixel = 2 bits, tile = 2 bytes
+      tile can be part of bg/window maps, or objects (sprites)
+    3 blocks:                   0x8000    0x8800
+      block 0: 0x8000 - 0x87FF    0-127    
+      block 1: 0x8800 - 0x8FFF  128-225   128-225
+      block 2: 0x9000 - 0x97FF              0-127 
+    2 addressing modes:
+      0x8000: always used for objects, bg/win if LCDC.4 = 1
+      0x8800: bg/win if LCDC.4 = 0
+    0x9800 - 0x9FFF   2x32x32 = 2048 bytes
+    tile maps: 2 maps of 32x32 indicies/bytes each
+    1 map = 32x32 tiles = 256x256 pixels
   */
+
+  u8 bootROM[256] = {
+    0x06, // ld b, imm8
+    0x69, // imm8 = 0x69 = 105
+    0x10, // stop
+  };
+  bool mapBootROM;
+
+
+  u8 zero = 0;
 
 public:
   u8 operator [](u16 addr) const {
+    if (addr <= 0xFF && mapBootROM)
+      return bootROM[addr];
+    if (0xE000 <= addr && addr <= 0xFDFF) {
+      printf("error: tried to access echo RAM\n");
+      return 0;
+    }
+    if (0xFEA0 <= addr && addr <= 0xFEFF) {
+      printf("error: tried to access not usable memory\n");
+      return 0;
+    }
     return memory[addr];
   }
 
   u8 & operator [](u16 addr) {
+    if (addr <= 0xFF && mapBootROM)
+      return bootROM[addr];
+    if (0xE000 <= addr && addr <= 0xFDFF) {
+      printf("error: tried to access echo RAM\n");
+      return zero = 0;
+    }
+    if (0xFEA0 <= addr && addr <= 0xFEFF) {
+      printf("error: tried to access not usable memory\n");
+      return zero = 0;
+    }
     return memory[addr];
   }
 
 public:
   void init() {
-
+    mapBootROM = true;
   }
 };
 
@@ -678,6 +724,27 @@ public:
     return {0,1};
   }
 
+  u8 tick() {
+    u8 opcode = bus[reg.pc];
+    Instruction instruction = parseInstruction(opcode);
+    if (instruction.type == ILLEGAL) {
+      std::cout << "illegal opcode encountered" << std::endl;
+      status = HALTED;
+      return 0;
+    }
+    if (instruction.type == PREFIX) {
+      opcode = bus[reg.pc+1];
+      instruction = parsePrefixedInstruction(opcode);
+    }
+    instruction.imm8low  = bus[reg.pc+1];
+    instruction.imm8high = bus[reg.pc+2];
+
+    ExecResult execResult = execute(instruction);
+    reg.pc += execResult.bytes;
+    
+    return execResult.cycles;
+  }
+
   void printState() {
     printf("HEX:\t\t\t\tDecimal:\n");
     printf("a: %#X\tf: %#X\taf: %#02X   \ta: %hhu\tf: %hhu\taf: %hu\n", reg.a, reg.f, reg.af, reg.a, reg.f, reg.af);
@@ -718,25 +785,11 @@ int main(void) {
 
   int cycles = 0;
   while (cpu.status == CPU::RUNNING || cpu.status == CPU::BOOTING) {
-    u8 opcode = cpu.bus[cpu.reg.pc];
-    CPU::Instruction instruction = cpu.parseInstruction(opcode);
-    if (instruction.type == CPU::ILLEGAL) {
-      std::cout << "illegal opcode encountered" << std::endl; break;
-    }
-    if (instruction.type == CPU::PREFIX) {
-      opcode = cpu.bus[cpu.reg.pc+1];
-      instruction = cpu.parsePrefixedInstruction(opcode);
-    }
-    instruction.imm8low  = cpu.bus[cpu.reg.pc+1];
-    instruction.imm8high = cpu.bus[cpu.reg.pc+2];
-
-    CPU::ExecResult execResult = cpu.execute(instruction);
-    cycles += execResult.cycles;
-    cpu.reg.pc += execResult.bytes;
+    cycles += cpu.tick();
   }
 
   cpu.printState();
-  printf("mem[420] = %hhu\n", cpu.bus[420]);
-  printf("mem[421] = %hhu\n", cpu.bus[421]);
+  //printf("mem[420] = %hhu\n", cpu.bus[420]);
+  //printf("mem[421] = %hhu\n", cpu.bus[421]);
   return 0;
 }
